@@ -65,7 +65,8 @@ static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat) {
                 key = fr->lru; 
                 break;
             default:
-              
+        
+            
                 key = fr->lru;
                 break;
         }
