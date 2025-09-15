@@ -1,57 +1,36 @@
-// buffer_mgr.c — Buffer Manager implementation for CS525 Assign 2
-// Implements FIFO and LRU; integrates with the provided Storage Manager.
-// Author: (your name)
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-
 #include "buffer_mgr.h"
 #include "storage_mgr.h"
 #include "dberror.h"
 #include "dt.h"
-
-// -----------------------------
-// Internal data structures
-// -----------------------------
-
-typedef struct Frame {
-    PageNumber pageNum;     // disk page number loaded in this frame (NO_PAGE if empty)
-    char *data;             // pointer to backing store for page data; index 1..PAGE_SIZE used
-    bool dirty;             // dirty flag
-    int  fixCount;          // number of pins
-    unsigned long long seq; // sequence number (FIFO arrival order)
-    unsigned long long lru; // last-used tick (LRU)
+typedef struct Frame { // It temprorarily holds the page data in the buffer pool from the disk
+    PageNumber pageNum;     
+    char *data;            
+    bool dirty;           
+    int  fixCount;        
+    unsigned long long seq; 
+    unsigned long long lru; 
 } Frame;
 
-typedef struct PoolMgmt {
-    SM_FileHandle fh;            // open file handle for the page file
-    Frame *frames;               // array of frames of length bm->numPages
-    int capacity;                // == bm->numPages (cached)
-
-    // statistics
-    int numReadIO;               // pages read from disk since init
-    int numWriteIO;              // pages written to disk since init
-
-    // replacement helpers
-    unsigned long long tick;     // global increasing counter for FIFO/LRU
+typedef struct PoolMgmt { // It tracks the file,frame,capacity and I/O results
+    SM_FileHandle fh;            
+    Frame *frames;              
+    int capacity;             
+    int numReadIO;               
+    int numWriteIO;             
+    unsigned long long tick;     
 } PoolMgmt;
 
-// -----------------------------
-// Local helpers (prototypes)
-// -----------------------------
-static PoolMgmt *mgmt(BM_BufferPool *const bm);
-static int findFrameIndexByPage(PoolMgmt *pm, PageNumber p);
-static int findEmptyFrameIndex(PoolMgmt *pm);
-static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat);
-static RC evictIfNeededAndLoad(PoolMgmt *pm, int fidx, PageNumber pageNum);
-static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr);
-static void touchForLRU(PoolMgmt *pm, Frame *fr);
-
-// -----------------------------
-// Helper implementations
-// -----------------------------
+static PoolMgmt *mgmt(BM_BufferPool *const bm);// get PoolMgmt struct from BM_BufferPool
+static int findFrameIndexByPage(PoolMgmt *pm, PageNumber p);//  find the index of a frame that holds the given page
+static int findEmptyFrameIndex(PoolMgmt *pm);//find an unused (empty) frame index
+static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat); //choose a frame to remove based on FIFO/LRU
+static RC evictIfNeededAndLoad(PoolMgmt *pm, int fidx, PageNumber pageNum);//remove old page (if needed) and load a new one into frame
+static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr);// write frame back to disk if it’s dirty
+static void touchForLRU(PoolMgmt *pm, Frame *fr);//update LRU timestamp 
 static PoolMgmt *mgmt(BM_BufferPool *const bm) {
     return (PoolMgmt*)bm->mgmtData;
 }
@@ -69,26 +48,24 @@ static int findEmptyFrameIndex(PoolMgmt *pm) {
     }
     return -1;
 }
-
-// Choose a victim frame index with fixCount==0 according to strategy; return -1 if none.
 static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat) {
     int victim = -1;
     unsigned long long best = ULLONG_MAX;
 
     for (int i = 0; i < pm->capacity; i++) {
         Frame *fr = &pm->frames[i];
-        if (fr->fixCount != 0) continue; // only evict unpinned
+        if (fr->fixCount != 0) continue; 
 
         unsigned long long key;
         switch (strat) {
             case RS_FIFO:
-                key = fr->seq; // smaller seq => older arrival
+                key = fr->seq; 
                 break;
             case RS_LRU:
-                key = fr->lru; // smaller lru => least recently used
+                key = fr->lru; 
                 break;
             default:
-                // Optional strategies not implemented; fall back to LRU semantics
+              
                 key = fr->lru;
                 break;
         }
@@ -110,39 +87,35 @@ static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr) {
 static RC evictIfNeededAndLoad(PoolMgmt *pm, int fidx, PageNumber pageNum) {
     Frame *fr = &pm->frames[fidx];
 
-    // If this frame currently holds a page, potentially flush if dirty
+   
     if (fr->pageNum != NO_PAGE) {
         RC rc = flushFrameIfDirty(pm, fr);
         if (rc != RC_OK) return rc;
     }
 
-    // Ensure file has enough pages
+
     RC rc = RC_OK;
     if (pageNum >= pm->fh.totalNumPages) {
         rc = ensureCapacity(pageNum + 1, &pm->fh);
         if (rc != RC_OK) return rc;
     }
-    // Load requested page into the frame
+  
     rc = readBlock(pageNum, &pm->fh, fr->data + 1);
     if (rc != RC_OK) return rc;
     pm->numReadIO += 1;
 
     fr->pageNum = pageNum;
     fr->dirty = FALSE;
-    fr->fixCount = 0; // pinPage will set to 1 after this call
-    fr->seq = ++pm->tick; // arrival sequence for FIFO
-    fr->lru = ++pm->tick; // treat load as a use for LRU
+    fr->fixCount = 0; 
+    fr->seq = ++pm->tick; 
+    fr->lru = ++pm->tick; 
     return RC_OK;
 }
 
 static void touchForLRU(PoolMgmt *pm, Frame *fr) {
     fr->lru = ++pm->tick;
 }
-
-// -----------------------------
 // Public Buffer Pool API
-// -----------------------------
-
 RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
                   const int numPages, ReplacementStrategy strategy,
                   void *stratData) {
@@ -231,9 +204,8 @@ RC forceFlushPool(BM_BufferPool *const bm) {
     return RC_OK;
 }
 
-// -----------------------------
 // Page Access API
-// -----------------------------
+
 
 RC markDirty(BM_BufferPool *const bm, BM_PageHandle *const page) {
     if (!bm || !bm->mgmtData || !page) return RC_FILE_HANDLE_NOT_INIT;
@@ -306,9 +278,8 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page,
     return RC_OK;
 }
 
-// -----------------------------
 // Statistics API
-// -----------------------------
+
 
 PageNumber *getFrameContents(BM_BufferPool *const bm) {
     if (!bm || !bm->mgmtData) return NULL;
