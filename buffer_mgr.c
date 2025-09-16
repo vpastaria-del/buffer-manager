@@ -31,30 +31,48 @@ static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat); //choose a frame
 static RC evictIfNeededAndLoad(PoolMgmt *pm, int fidx, PageNumber pageNum);//remove old page (if needed) and load a new one into frame
 static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr);// write frame back to disk if it’s dirty
 static void touchForLRU(PoolMgmt *pm, Frame *fr);//update LRU timestamp 
+
 static PoolMgmt *mgmt(BM_BufferPool *const bm) {
     return (PoolMgmt*)bm->mgmtData;
 }
 
 static int findFrameIndexByPage(PoolMgmt *pm, PageNumber p) {
+    // simple linear scan
     for (int i = 0; i < pm->capacity; i++) {
-        if (pm->frames[i].pageNum == p) return i;
+        if (pm->frames[i].pageNum == p) {
+            return i;
+        }
     }
     return -1;
 }
 
 static int findEmptyFrameIndex(PoolMgmt *pm) {
+    // first slot whose pageNum is NO_PAGE
     for (int i = 0; i < pm->capacity; i++) {
-        if (pm->frames[i].pageNum == NO_PAGE) return i;
+        if (pm->frames[i].pageNum == NO_PAGE) {
+            return i;
+        }
     }
     return -1;
 }
+
 static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat) {
-    int victim = -1;
-    unsigned long long best = ULLONG_MAX;
+    int firstFree = -1;
+
+    for (int i = 0; i < pm->capacity; i++) {
+        if (pm->frames[i].fixCount == 0 && pm->frames[i].pageNum != NO_PAGE) {
+            firstFree = i;
+            break;
+        }
+    }
+    if (firstFree < 0) return -1;
+
+    int victim = firstFree;
+    unsigned long long bestKey = ULLONG_MAX;
 
     for (int i = 0; i < pm->capacity; i++) {
         Frame *fr = &pm->frames[i];
-        if (fr->fixCount != 0) continue; 
+        if (fr->fixCount != 0 || fr->pageNum == NO_PAGE) continue;
 
         unsigned long long key;
         switch (strat) {
@@ -65,21 +83,27 @@ static int pickVictim(PoolMgmt *pm, ReplacementStrategy strat) {
                 key = fr->lru; 
                 break;
             default:
-        
-            
+             
                 key = fr->lru;
                 break;
         }
-        if (key < best) { best = key; victim = i; }
+
+        if (key < bestKey) {
+            bestKey = key;
+            victim = i;
+        }
     }
     return victim;
 }
 
 static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr) {
-    if (fr->pageNum == NO_PAGE) return RC_OK; // nothing to do
+    if (fr->pageNum == NO_PAGE) return RC_OK; 
     if (!fr->dirty) return RC_OK;
+
+    // write the page back
     RC rc = writeBlock(fr->pageNum, &pm->fh, fr->data + 1);
     if (rc != RC_OK) return rc;
+
     pm->numWriteIO += 1;
     fr->dirty = FALSE;
     return RC_OK;
@@ -87,35 +111,34 @@ static RC flushFrameIfDirty(PoolMgmt *pm, Frame *fr) {
 
 static RC evictIfNeededAndLoad(PoolMgmt *pm, int fidx, PageNumber pageNum) {
     Frame *fr = &pm->frames[fidx];
-
-   
     if (fr->pageNum != NO_PAGE) {
-        RC rc = flushFrameIfDirty(pm, fr);
-        if (rc != RC_OK) return rc;
+        RC rcFlush = flushFrameIfDirty(pm, fr);
+        if (rcFlush != RC_OK) return rcFlush;
     }
-
-
-    RC rc = RC_OK;
     if (pageNum >= pm->fh.totalNumPages) {
-        rc = ensureCapacity(pageNum + 1, &pm->fh);
-        if (rc != RC_OK) return rc;
+        RC rcCap = ensureCapacity(pageNum + 1, &pm->fh);
+        if (rcCap != RC_OK) return rcCap;
     }
-  
-    rc = readBlock(pageNum, &pm->fh, fr->data + 1);
-    if (rc != RC_OK) return rc;
+    RC rcRead = readBlock(pageNum, &pm->fh, fr->data + 1);
+    if (rcRead != RC_OK) return rcRead;
+
     pm->numReadIO += 1;
 
+    // reset frame metadata in a simple way
     fr->pageNum = pageNum;
     fr->dirty = FALSE;
-    fr->fixCount = 0; 
-    fr->seq = ++pm->tick; 
-    fr->lru = ++pm->tick; 
+    fr->fixCount = 0;
+    pm->tick += 1;
+    fr->seq = pm->tick;   // when it was loaded
+    fr->lru = pm->tick;   // most recent "use" time
     return RC_OK;
 }
 
 static void touchForLRU(PoolMgmt *pm, Frame *fr) {
-    fr->lru = ++pm->tick;
+    pm->tick += 1;
+    fr->lru = pm->tick;
 }
+
 // Public Buffer Pool API
 RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
                   const int numPages, ReplacementStrategy strategy,
@@ -124,36 +147,44 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
     if (bm == NULL || pageFileName == NULL || numPages <= 0) return RC_FILE_HANDLE_NOT_INIT;
 
     PoolMgmt *pm = (PoolMgmt*)calloc(1, sizeof(PoolMgmt));
-    if (!pm) return RC_FILE_HANDLE_NOT_INIT;
+    if (pm == NULL) return RC_FILE_HANDLE_NOT_INIT;
 
-    RC rc = openPageFile((char*)pageFileName, &pm->fh);
-    if (rc != RC_OK) { free(pm); return rc; }
+    RC rcOpen = openPageFile((char*)pageFileName, &pm->fh);
+    if (rcOpen != RC_OK) {
+        free(pm);
+        return rcOpen;
+    }
 
     pm->capacity = numPages;
     pm->frames = (Frame*)calloc(numPages, sizeof(Frame));
-    if (!pm->frames) { closePageFile(&pm->fh); free(pm); return RC_FILE_HANDLE_NOT_INIT; }
+    if (pm->frames == NULL) {
+        closePageFile(&pm->fh);
+        free(pm);
+        return RC_FILE_HANDLE_NOT_INIT;
+    }
 
     // allocate backing storage for each frame; use 1-based addressing to match provided printers
     for (int i = 0; i < numPages; i++) {
         pm->frames[i].data = (char*)malloc(PAGE_SIZE + 1);
-        if (!pm->frames[i].data) {
-            // clean up partial allocation
-            for (int j = 0; j < i; j++) free(pm->frames[j].data);
+        if (pm->frames[i].data == NULL) {
+            for (int j = 0; j < i; j++) {
+                free(pm->frames[j].data);
+            }
             free(pm->frames);
             closePageFile(&pm->fh);
             free(pm);
             return RC_FILE_HANDLE_NOT_INIT;
         }
-        pm->frames[i].pageNum = NO_PAGE;
-        pm->frames[i].dirty = FALSE;
+        pm->frames[i].pageNum  = NO_PAGE;
+        pm->frames[i].dirty    = FALSE;
         pm->frames[i].fixCount = 0;
-        pm->frames[i].seq = 0;
-        pm->frames[i].lru = 0;
+        pm->frames[i].seq      = 0;
+        pm->frames[i].lru      = 0;
     }
 
-    pm->numReadIO = 0;
+    pm->numReadIO  = 0;
     pm->numWriteIO = 0;
-    pm->tick = 0ULL;
+    pm->tick       = 0ULL;
 
     bm->pageFile = (char*)pageFileName;
     bm->numPages = numPages;
@@ -164,7 +195,7 @@ RC initBufferPool(BM_BufferPool *const bm, const char *const pageFileName,
 }
 
 RC shutdownBufferPool(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
 
     // Flush only unpinned dirty frames; allow shutdown even if some pages remain pinned
@@ -178,21 +209,23 @@ RC shutdownBufferPool(BM_BufferPool *const bm) {
 
     // free memory
     for (int i = 0; i < pm->capacity; i++) {
-        free(pm->frames[i].data);
-        pm->frames[i].data = NULL;
+        if (pm->frames[i].data) {
+            free(pm->frames[i].data);
+            pm->frames[i].data = NULL;
+        }
     }
     free(pm->frames);
     pm->frames = NULL;
 
-    RC rc = closePageFile(&pm->fh);
+    RC rcClose = closePageFile(&pm->fh);
     free(pm);
     bm->mgmtData = NULL;
 
-    return rc;
+    return rcClose;
 }
 
 RC forceFlushPool(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
 
     for (int i = 0; i < pm->capacity; i++) {
@@ -207,9 +240,8 @@ RC forceFlushPool(BM_BufferPool *const bm) {
 
 // Page Access API
 
-
 RC markDirty(BM_BufferPool *const bm, BM_PageHandle *const page) {
-    if (!bm || !bm->mgmtData || !page) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL || page == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
     int idx = findFrameIndexByPage(pm, page->pageNum);
     if (idx < 0) return RC_READ_NON_EXISTING_PAGE;
@@ -218,26 +250,30 @@ RC markDirty(BM_BufferPool *const bm, BM_PageHandle *const page) {
 }
 
 RC unpinPage(BM_BufferPool *const bm, BM_PageHandle *const page) {
-    if (!bm || !bm->mgmtData || !page) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL || page == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
     int idx = findFrameIndexByPage(pm, page->pageNum);
     if (idx < 0) return RC_READ_NON_EXISTING_PAGE;
-    if (pm->frames[idx].fixCount > 0) pm->frames[idx].fixCount -= 1;
+
+    // student: just decrement if positive
+    if (pm->frames[idx].fixCount > 0) {
+        pm->frames[idx].fixCount -= 1;
+    }
+    // touching LRU on unpin is optional; keep it simple and don't bump here
     return RC_OK;
 }
 
 RC forcePage(BM_BufferPool *const bm, BM_PageHandle *const page) {
-    if (!bm || !bm->mgmtData || !page) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL || page == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
     int idx = findFrameIndexByPage(pm, page->pageNum);
     if (idx < 0) return RC_READ_NON_EXISTING_PAGE;
-    RC rc = flushFrameIfDirty(pm, &pm->frames[idx]);
-    return rc;
+    return flushFrameIfDirty(pm, &pm->frames[idx]);
 }
 
 RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page,
            const PageNumber pageNum) {
-    if (!bm || !bm->mgmtData || !page) return RC_FILE_HANDLE_NOT_INIT;
+    if (bm == NULL || bm->mgmtData == NULL || page == NULL) return RC_FILE_HANDLE_NOT_INIT;
     PoolMgmt *pm = mgmt(bm);
 
     if (pageNum < 0) return RC_READ_NON_EXISTING_PAGE;
@@ -266,8 +302,8 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page,
     }
 
     // Evict if needed and load requested page
-    RC rc = evictIfNeededAndLoad(pm, idx, pageNum);
-    if (rc != RC_OK) return rc;
+    RC rcLoad = evictIfNeededAndLoad(pm, idx, pageNum);
+    if (rcLoad != RC_OK) return rcLoad;
 
     // Pin and return handle
     Frame *fr = &pm->frames[idx];
@@ -281,37 +317,45 @@ RC pinPage(BM_BufferPool *const bm, BM_PageHandle *const page,
 
 // Statistics API
 
-
 PageNumber *getFrameContents(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return NULL;
+    if (bm == NULL || bm->mgmtData == NULL) return NULL;
     PoolMgmt *pm = mgmt(bm);
     PageNumber *arr = (PageNumber*)malloc(sizeof(PageNumber) * pm->capacity);
-    for (int i = 0; i < pm->capacity; i++) arr[i] = pm->frames[i].pageNum;
+    if (arr == NULL) return NULL;
+    for (int i = 0; i < pm->capacity; i++) {
+        arr[i] = pm->frames[i].pageNum;
+    }
     return arr;
 }
 
 bool *getDirtyFlags(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return NULL;
+    if (bm == NULL || bm->mgmtData == NULL) return NULL;
     PoolMgmt *pm = mgmt(bm);
     bool *arr = (bool*)malloc(sizeof(bool) * pm->capacity);
-    for (int i = 0; i < pm->capacity; i++) arr[i] = pm->frames[i].dirty ? TRUE : FALSE;
+    if (arr == NULL) return NULL;
+    for (int i = 0; i < pm->capacity; i++) {
+        arr[i] = pm->frames[i].dirty ? TRUE : FALSE;
+    }
     return arr;
 }
 
 int *getFixCounts(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return NULL;
+    if (bm == NULL || bm->mgmtData == NULL) return NULL;
     PoolMgmt *pm = mgmt(bm);
     int *arr = (int*)malloc(sizeof(int) * pm->capacity);
-    for (int i = 0; i < pm->capacity; i++) arr[i] = pm->frames[i].fixCount;
+    if (arr == NULL) return NULL;
+    for (int i = 0; i < pm->capacity; i++) {
+        arr[i] = pm->frames[i].fixCount;
+    }
     return arr;
 }
 
 int getNumReadIO(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return -1;
+    if (bm == NULL || bm->mgmtData == NULL) return -1;
     return mgmt(bm)->numReadIO;
 }
 
 int getNumWriteIO(BM_BufferPool *const bm) {
-    if (!bm || !bm->mgmtData) return -1;
+    if (bm == NULL || bm->mgmtData == NULL) return -1;
     return mgmt(bm)->numWriteIO;
 }
